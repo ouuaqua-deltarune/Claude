@@ -1,0 +1,18 @@
+I use arch btw
+pacman -S i 1
+while i <= 15
+  if i % 15 == 0
+    echo "FizzBuzz"
+  else
+    if i % 3 == 0
+      echo "Fizz"
+    else
+      if i % 5 == 0
+        echo "Buzz"
+      else
+        echo i
+      fi
+    fi
+  fi
+  pacman -S i i + 1
+done
