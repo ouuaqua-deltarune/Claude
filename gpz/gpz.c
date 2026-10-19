@@ -4,8 +4,8 @@
  * the binary starts fine on machines without a GPU or OpenCL driver.
  * Plain C99, 32-bit safe, no SIMD, no unaligned access, endian-neutral.
  */
-#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -14,6 +14,13 @@
   #include <windows.h>
 #else
   #include <dlfcn.h>
+  #include <unistd.h>
+  #include <pthread.h>
+  #include <dirent.h>
+  #include <fcntl.h>
+  #include <fnmatch.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
 #endif
 
 #include "codec.h"
@@ -29,8 +36,8 @@ static void die(const char *m) { fprintf(stderr, "gpz: %s\n", m); exit(1); }
 static void put32(u8 *p, u32 v) { p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); p[3]=(u8)(v>>24); }
 static u32 get32(const u8 *p) { return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24); }
 
-static u32 crc32(const u8 *d, size_t n) {
-    static u32 t[256]; u32 c = 0xFFFFFFFFu; size_t i; int k;
+static u32 crc32u(u32 crc, const u8 *d, size_t n) {   /* incremental: crc32u(crc32u(0,a),b) == crc32(a+b) */
+    static u32 t[256]; u32 c = ~crc; size_t i; int k;
     if (!t[1]) for (i = 0; i < 256; i++) {
         u32 x = (u32)i; for (k = 0; k < 8; k++) x = (x & 1) ? 0xEDB88320u ^ (x >> 1) : x >> 1;
         t[i] = x;
@@ -38,6 +45,7 @@ static u32 crc32(const u8 *d, size_t n) {
     for (i = 0; i < n; i++) c = t[(c ^ d[i]) & 0xFF] ^ (c >> 8);
     return ~c;
 }
+static u32 crc32(const u8 *d, size_t n) { return crc32u(0, d, n); }
 static double now(void) {   /* wall clock: clock() would miss time spent waiting on the GPU */
 #ifdef _WIN32
     return (double)GetTickCount64() / 1000.0;
@@ -313,6 +321,7 @@ static void spit(const char *path, const u8 *a, size_t an, const u8 *b, size_t b
 }
 
 #include "gpz2.h"
+#include "gpucm.h"
 
 /* ---------------- compress / decompress ---------------- */
 typedef struct { int use_gpu, force_gpu, force_cpu, dev, lazy, bslog, max, notx; } Opt;
@@ -448,6 +457,55 @@ static void do_decompress(const char *in, const char *outp, const Opt *o) {
     free(f); free(raw); free(tab); free(P);
 }
 
+
+/* ---- hidden self-test: GPU context-mixing slots must match the CPU byte for byte ---- */
+typedef struct { CmJob *jobs; u32 n, next; } CmTestSrc;
+static int cmtest_next(void *c, int block, CmJob **j) {
+    CmTestSrc *s = (CmTestSrc *)c; (void)block;
+    if (s->next >= s->n) return -1;
+    *j = &s->jobs[s->next++]; return 1;
+}
+static void cmtest_done(void *c, CmJob *j) { (void)c; (void)j; }
+
+static int do_cmtest(const char *path, const Opt *o, u32 usz, u32 tbits, u32 slots) {
+    size_t n; u8 *src = slurp(path, &n); u32 nu = (u32)((n + usz - 1) / usz), i; DevInfo dv[MAXDEV]; CmGpu g; int bad = 0, e;
+    CmJob *ej = (CmJob *)calloc(nu, sizeof(CmJob)), *dj = (CmJob *)calloc(nu, sizeof(CmJob)); CmTestSrc s;
+    u8 *cpu = (u8 *)malloc((size_t)nu * usz + 1), *gout = (u8 *)malloc((size_t)nu * usz + 1), *back = (u8 *)malloc((size_t)nu * usz + 1);
+    size_t *cpun = (size_t *)calloc(nu, sizeof(size_t));
+    if (!cpu || !gout || !back || !ej || !dj || !cpun) die("out of memory");
+    if (list_devices(dv, getenv("GPZ_ANY_DEVICE") == NULL) <= o->dev) die("no GPU");
+    e = cmgpu_open(&g, dv[o->dev].dev, (cl_ulong)3 << 30, tbits, usz, slots);
+    if (e) { fprintf(stderr, "cmgpu_open failed: %d\n", e); return 1; }
+    fprintf(stderr, "cmtest: %lu units, %lu slots, %lu MB device memory\n", (unsigned long)nu, (unsigned long)g.nslots, (unsigned long)(g.used >> 20));
+    for (i = 0; i < nu; i++) {
+        size_t off = (size_t)i * usz, len = n - off > usz ? usz : n - off;
+        cpun[i] = cm_compress(src + off, len, cpu + (size_t)i * usz, len, tbits);
+        ej[i].in = src + off; ej[i].n = (u32)len; ej[i].tbits = tbits; ej[i].out = gout + (size_t)i * usz;
+    }
+    s.jobs = ej; s.n = nu; s.next = 0;
+    e = cmgpu_run(&g, 0, cmtest_next, cmtest_done, &s);
+    if (e) { fprintf(stderr, "cmgpu_run(encode) error %d\n", e); return 1; }
+    for (i = 0; i < nu; i++) {
+        int same = (cpun[i] == 0) ? (ej[i].status == 1) : (ej[i].status == 0 && ej[i].outlen == cpun[i] && !memcmp(cpu + (size_t)i * usz, gout + (size_t)i * usz, cpun[i]));
+        if (!same) { fprintf(stderr, "unit %lu: GPU/CPU encode differ (cpu %lu, gpu %lu status %d)\n", (unsigned long)i, (unsigned long)cpun[i], (unsigned long)ej[i].outlen, ej[i].status); bad = 1; }
+    }
+    for (i = 0; i < nu; i++) {
+        dj[i].in = gout + (size_t)i * usz; dj[i].cn = ej[i].outlen; dj[i].n = ej[i].n; dj[i].tbits = tbits; dj[i].out = back + (size_t)i * usz;
+        if (ej[i].status != 0) { dj[i].n = 0; }
+    }
+    s.jobs = dj; s.next = 0;
+    e = cmgpu_run(&g, 1, cmtest_next, cmtest_done, &s);
+    if (e) { fprintf(stderr, "cmgpu_run(decode) error %d\n", e); return 1; }
+    for (i = 0; i < nu; i++)
+        if (ej[i].status == 0 && (dj[i].status != 0 || memcmp(back + (size_t)i * usz, src + (size_t)i * usz, ej[i].n))) {
+            fprintf(stderr, "unit %lu: GPU decode mismatch\n", (unsigned long)i); bad = 1; }
+    fprintf(stderr, "cmtest: %s (%lu launches, %.2fs in kernels)\n", bad ? "FAILED" : "GPU matches CPU for encode and decode",
+            (unsigned long)g.launches, g.ktime);
+    return bad;
+}
+
+#include "arch.h"
+
 static void do_list(void) {
     DevInfo dv[MAXDEV]; int n, i;
     if (!cl_load()) { puts("OpenCL: not available (CPU mode only)"); return; }
@@ -463,7 +521,15 @@ static void do_list(void) {
 }
 
 static void usage(void) {
-    fputs("usage: gpz [options] c <in> [out]   compress (default out: <in>.gpz)\n"
+    fputs("Minecraft server / folder snapshots:\n"
+          "  gpz pack   [opts] <folder> [archive.gpza]   (default name: <folder>-YYYYMMDD-HHMMSS.gpza)\n"
+          "  gpz unpack [opts] <archive.gpza> [dest]     restore exactly (use --force into a non-empty dir)\n"
+          "  gpz verify <archive.gpza>                   check every file's checksum, writes nothing\n"
+          "  gpz ls     <archive.gpza>                   list contents and snapshot time\n"
+          "  opts: -t N CPU threads  -g|-c force/forbid GPU  -d N GPU index  --vram MB  --slots N  --model BITS\n"
+          "        -x PATTERN exclude (repeatable, e.g. -x cache -x '*.tmp')  -n no deflate recompression\n"
+          "Single files:\n"
+          "usage: gpz [options] c <in> [out]   compress (default out: <in>.gpz)\n"
           "       gpz [options] d <in> [out]   decompress\n"
           "       gpz list                     show OpenCL devices\n"
           "options: -g force GPU   -c force CPU   -d N GPU index (default 0)\n"
@@ -475,10 +541,24 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    Opt o; int a = 1; const char *cmd, *in, *out; char *buf = NULL;
+    Opt o; int a, np = 0; const char *cmd, *in, *out; char *buf = NULL; char **pv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+    ArOpt ao; memset(&ao, 0, sizeof ao); ao.dev = 0;
     memset(&o, 0, sizeof o);
-    for (; a < argc && argv[a][0] == '-' && argv[a][1]; a++) {
+    for (a = 1; a < argc; a++) {                       /* options may appear anywhere */
+        if (!(argv[a][0] == '-' && argv[a][1])) { pv[np++] = argv[a]; continue; }
+        if (argv[a][1] == '-') {                       /* long options (archive mode) */
+            const char *k = argv[a] + 2;
+            if (!strcmp(k, "force")) ao.force = 1;
+            else if (!strcmp(k, "vram") && a + 1 < argc) ao.vram_mb = strtoul(argv[++a], NULL, 10);
+            else if (!strcmp(k, "slots") && a + 1 < argc) ao.slots = (u32)atoi(argv[++a]);
+            else if (!strcmp(k, "model") && a + 1 < argc) ao.tbits = (u32)atoi(argv[++a]);
+            else if (!strcmp(k, "unit-mb") && a + 1 < argc) ao.umax = (u32)atoi(argv[++a]) << 20;
+            else usage();
+            continue;
+        }
         switch (argv[a][1]) {
+        case 't': if (++a >= argc) usage(); ao.threads = atoi(argv[a]); break;
+        case 'x': if (++a >= argc || ao.nexcl >= 32) usage(); ao.excl[ao.nexcl++] = argv[a]; break;
         case 'g': o.force_gpu = 1; break;
         case 'c': o.force_cpu = 1; break;
         case 'u': o.lazy = 1; break;
@@ -492,9 +572,34 @@ int main(int argc, char **argv) {
         default: usage();
         }
     }
+    argv = pv; argc = np; a = 0;                       /* from here on: positional arguments only */
     if (a >= argc) usage();
     cmd = argv[a++];
+    ao.force_gpu = o.force_gpu; ao.force_cpu = o.force_cpu; ao.dev = o.dev; ao.notx = o.notx;
     if (!strcmp(cmd, "list")) { do_list(); return 0; }
+    if (!strcmp(cmd, "pack") && a < argc) {
+        char def[512]; const char *root = argv[a], *b;
+        if (a + 1 < argc) snprintf(def, sizeof def, "%s", argv[a + 1]);
+        else {
+            char *rp = realpath(root, NULL); time_t tt = time(NULL); struct tm tmv;
+            b = rp ? strrchr(rp, '/') : NULL; b = b ? b + 1 : root;
+            gmtime_r(&tt, &tmv);
+            snprintf(def, sizeof def, "%s-%04d%02d%02d-%02d%02d%02d.gpza", b[0] ? b : "snapshot", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+            free(rp);
+        }
+        do_pack(root, def, &ao); return 0;
+    }
+    if ((!strcmp(cmd, "unpack") || !strcmp(cmd, "verify") || !strcmp(cmd, "ls")) && a < argc) {
+        if (!strcmp(cmd, "ls")) { do_ls(argv[a], 0); return 0; }
+        if (!strcmp(cmd, "verify")) { do_unpack(argv[a], NULL, &ao, 1); return 0; }
+        {
+            char def[512];
+            if (a + 1 < argc) snprintf(def, sizeof def, "%s", argv[a + 1]);
+            else { size_t l = strlen(argv[a]); snprintf(def, sizeof def, "%s", argv[a]); if (l > 5 && !strcmp(def + l - 5, ".gpza")) def[l - 5] = 0; else strcat(def, ".out"); }
+            do_unpack(argv[a], def, &ao, 0); return 0;
+        }
+    }
+    if (!strcmp(cmd, "cmtest") && a < argc) return do_cmtest(argv[a], &o, 1u << 18, 18, 6);
     if (a >= argc || (cmd[0] != 'c' && cmd[0] != 'd') || cmd[1]) usage();
     in = argv[a++];
     if (a < argc) out = argv[a];

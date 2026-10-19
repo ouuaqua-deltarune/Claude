@@ -6,16 +6,7 @@
  * range coder. Integer only, no SIMD, no unaligned access, endian-neutral.
  * Every block is coded independently => one GPU work-item per block.
  */
-#ifdef __OPENCL_VERSION__
-  #define GP __global
-  #define FN
-  typedef uchar u8; typedef ushort u16; typedef uint u32; typedef ulong u64;
-#else
-  #define GP
-  #define FN static
-  typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32;
-  typedef unsigned long long u64;
-#endif
+#include "common.h"
 
 #define GPZ_FAIL      0xFFFFFFFFu
 #define GPZ_MINLEN    3u
