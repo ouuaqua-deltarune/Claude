@@ -35,9 +35,33 @@ for f in empty one random zeros text mixed; do
   done
   echo "ok $f ($(wc -c < $T/$f) -> $(wc -c < $T/$f.cpu) bytes)"
 done
+# max-ratio mode (context mixing), with and without deflate recompression
+for f in empty one random zeros text mixed; do
+  ./gpz -m c $T/$f $T/$f.cm 2>/dev/null; ./gpz d $T/$f.cm $T/$f.cmrt 2>/dev/null
+  cmp -s $T/$f $T/$f.cmrt || { echo "FAIL max mode $f"; fail=1; }
+done
+echo "ok max-ratio mode round trips"
+if command -v python3 >/dev/null && python3 -c 'import zlib' 2>/dev/null; then
+  python3 - "$T" <<'PY'
+import gzip, zipfile, sys
+t = sys.argv[1]; d = open(t + '/text', 'rb').read()
+with gzip.open(t + '/py.gz', 'wb', compresslevel=9) as f: f.write(d)
+with zipfile.ZipFile(t + '/py.zip', 'w', zipfile.ZIP_DEFLATED) as z: z.writestr('a', d); z.writestr('b', d[:50000])
+PY
+  for f in py.gz py.zip; do
+    ./gpz -m c $T/$f $T/$f.cm 2>$T/log; ./gpz d $T/$f.cm $T/$f.rt 2>/dev/null
+    cmp -s $T/$f $T/$f.rt || { echo "FAIL deflate recompression $f"; fail=1; }
+    grep -q "recompressed" $T/log && ! grep -q " 0 deflate stream(s) recompressed" $T/log \
+      && echo "ok $f recompressed ($(wc -c < $T/$f) -> $(wc -c < $T/$f.cm) bytes)" \
+      || echo "note: $f not recompressed (zlib not found?)"
+  done
+fi
 # corruption must be detected, not crash
 ./gpz -c c $T/text $T/bad.gpz 2>/dev/null
 printf 'X' | dd of=$T/bad.gpz bs=1 seek=5000 conv=notrunc 2>/dev/null
 if ./gpz -c d $T/bad.gpz $T/bad.out 2>/dev/null; then echo "FAIL corruption undetected"; fail=1; else echo "ok corruption detected"; fi
+./gpz -m c $T/text $T/bad2.gpz 2>/dev/null
+printf 'X' | dd of=$T/bad2.gpz bs=1 seek=3000 conv=notrunc 2>/dev/null
+if ./gpz d $T/bad2.gpz $T/bad2.out 2>/dev/null; then echo "FAIL max-mode corruption undetected"; fail=1; else echo "ok max-mode corruption detected"; fi
 [ $GPU = 1 ] && echo "GPU legs: ran" || echo "GPU legs: skipped (no OpenCL GPU)"
 exit $fail

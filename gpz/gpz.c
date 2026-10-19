@@ -224,8 +224,10 @@ static void spit(const char *path, const u8 *a, size_t an, const u8 *b, size_t b
     if (fclose(f)) die("write error");
 }
 
+#include "gpz2.h"
+
 /* ---------------- compress / decompress ---------------- */
-typedef struct { int use_gpu, force_gpu, force_cpu, dev, lazy, bslog; } Opt;
+typedef struct { int use_gpu, force_gpu, force_cpu, dev, lazy, bslog, max, notx; } Opt;
 
 static Gpu *pick_gpu(Gpu *store, const Opt *o, u32 bs) {
     DevInfo dv[MAXDEV]; int n;
@@ -292,6 +294,7 @@ static void do_compress(const char *in, const char *outp, const Opt *o) {
 static void do_decompress(const char *in, const char *outp, const Opt *o) {
     size_t n; u8 *f = slurp(in, &n), *raw, *p; u32 size, bs, nb, i, *tab, bad = 0; Gpu gs, *g;
     double t0 = now();
+    if (n >= 20 && !memcmp(f, "GPZ2", 4)) { do_decompress2(f, n, outp, in); free(f); return; }
     if (n < HDR || memcmp(f, MAGIC, 4)) die("not a GPZ file");
     if (f[5] < 10 || f[5] > 24) die("bad block size");
     bs = 1u << f[5]; size = get32(f + 8);
@@ -351,7 +354,9 @@ static void usage(void) {
           "       gpz [options] d <in> [out]   decompress\n"
           "       gpz list                     show OpenCL devices\n"
           "options: -g force GPU   -c force CPU   -d N GPU index (default 0)\n"
-          "         -u ultra (lazy matching, smaller output, slower)\n"
+          "         -m MAX RATIO: context mixing + deflate recompression (CPU, slow)\n"
+          "         -n with -m: do not recompress zip/gzip streams\n"
+          "         -u fast mode: lazy matching, smaller output, slower\n"
           "         -b N block size = 2^N bytes (10..24, default 16)   -v verbose\n", stderr);
     exit(2);
 }
@@ -364,6 +369,8 @@ int main(int argc, char **argv) {
         case 'g': o.force_gpu = 1; break;
         case 'c': o.force_cpu = 1; break;
         case 'u': o.lazy = 1; break;
+        case 'm': o.max = 1; break;
+        case 'n': o.notx = 1; break;
         case 'v': verbose = 1; break;
         case 'd': if (++a >= argc) usage(); o.dev = atoi(argv[a]); break;
         case 'b': if (++a >= argc) usage(); o.bslog = atoi(argv[a]);
@@ -385,7 +392,8 @@ int main(int argc, char **argv) {
         else { strcpy(buf, in); strcat(buf, ".out"); }
         out = buf;
     }
-    if (cmd[0] == 'c') do_compress(in, out, &o); else do_decompress(in, out, &o);
+    if (cmd[0] == 'c') { if (o.max) do_compress2(in, out, !o.notx); else do_compress(in, out, &o); }
+    else do_decompress(in, out, &o);
     free(buf);
     return 0;
 }
