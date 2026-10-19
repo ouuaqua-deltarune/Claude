@@ -4,6 +4,7 @@
  * the binary starts fine on machines without a GPU or OpenCL driver.
  * Plain C99, 32-bit safe, no SIMD, no unaligned access, endian-neutral.
  */
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +39,14 @@ static u32 crc32(const u8 *d, size_t n) {
     for (i = 0; i < n; i++) c = t[(c ^ d[i]) & 0xFF] ^ (c >> 8);
     return ~c;
 }
-static double now(void) { return (double)clock() / CLOCKS_PER_SEC; }
+static double now(void) {   /* wall clock: clock() would miss time spent waiting on the GPU */
+#ifdef _WIN32
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+}
 
 /* ---------------- OpenCL, loaded dynamically ---------------- */
 typedef int cl_int; typedef unsigned int cl_uint; typedef unsigned long long cl_ulong;
