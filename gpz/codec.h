@@ -20,7 +20,7 @@
 #define GPZ_FAIL      0xFFFFFFFFu
 #define GPZ_MINLEN    3u
 #define GPZ_MAXLEN    258u
-#define GPZ_HBITS     12
+#define GPZ_HBITS     11
 #define GPZ_WAYS      4u
 #define GPZ_HSIZE     ((1u << GPZ_HBITS) * GPZ_WAYS)   /* u32 entries per block */
 

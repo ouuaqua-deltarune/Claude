@@ -18,11 +18,11 @@ if ./gpz -g c $T/one $T/probe >/dev/null 2>&1; then GPU=1; fi
 fail=0
 for f in empty one random zeros text mixed; do
   for u in "" -u; do
-    ./gpz -c $u c $T/$f $T/$f.cpu 2>/dev/null
+    ./gpz -c -b 14 $u c $T/$f $T/$f.cpu 2>/dev/null
     modes="c"; [ $GPU = 1 ] && modes="c g"
     for m in $modes; do
       if [ $m = g ]; then
-        ./gpz -g $u c $T/$f $T/$f.gpu 2>/dev/null
+        ./gpz -g -b 14 $u c $T/$f $T/$f.gpu 2>/dev/null
         cmp -s $T/$f.cpu $T/$f.gpu || { echo "FAIL $f $u: CPU and GPU compressed output differ"; fail=1; }
       fi
       for d in c g; do

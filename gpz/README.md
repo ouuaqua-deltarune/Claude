@@ -60,6 +60,18 @@ byte-identical and checked by CRC. Streams that cannot be reproduced stay as-is.
 Cost: about 0.25 MB/s, CPU only (context mixing is sequential, so it does not
 map onto the GPU), roughly 150 MB of RAM. It is for archiving, not speed.
 
+## GPU parallelism
+Fast mode launches one GPU thread per block and keeps up to 8192 blocks in
+flight per launch (bounded by device memory, auto-detected), so large files
+keep thousands of GPU threads busy. `-v` prints the thread count, launches and
+time spent in kernels. For more threads on smaller files use `-b 14` (16 KB
+blocks): more parallelism, but text compresses roughly 20% worse.
+
+CUDA: NVIDIA GPUs are already driven through their OpenCL driver (same cores).
+A native CUDA backend is not included; I could not build or test one.
+Max-ratio mode is CPU-only: each model needs ~150 MB, which cannot be
+replicated across thousands of GPU threads.
+
 ## Honest limits
 - **Fast mode (default) is not "ultra small":** roughly gzip -9 sized on text.
   Use `-m` for the best ratio.

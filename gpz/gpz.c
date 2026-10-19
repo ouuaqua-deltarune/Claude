@@ -21,7 +21,6 @@
 
 #define MAGIC "GPZ1"
 #define HDR 20
-#define BATCH 256u
 
 static int verbose;
 
@@ -59,6 +58,7 @@ typedef struct _k *cl_kernel;
 #define CL_DEVICE_VENDOR 0x102C
 #define CL_DEVICE_TYPE 0x1000
 #define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
+#define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
 #define CL_PROGRAM_BUILD_LOG 0x1183
 #define CL_MEM_READ_WRITE 1ull
 #define CL_MEM_WRITE_ONLY 2ull
@@ -130,7 +130,8 @@ static int list_devices(DevInfo *out, int gpu_only) {
 typedef struct {
     cl_context ctx; cl_queue q; cl_program prog; cl_kernel kc, kd;
     cl_mem src, out, osz, P, H, ioff, tab, st;   /* batch buffers */
-    u32 bs, cap;
+    u32 bs, cap, maxb;       /* block size; max blocks in flight per launch */
+    double ktime; u32 launches;
 } Gpu;
 
 static void clcheck(cl_int e, const char *what) {
@@ -143,8 +144,17 @@ static cl_mem mkbuf(Gpu *g, cl_ulong fl, size_t sz, const char *w) {
 
 static void gpu_open(Gpu *g, cl_device dev, u32 bs) {
     cl_int e; const char *srcs[1]; size_t len; char *log; size_t ll = 0;
+    cl_ulong maxalloc = 0, gmem = 0; size_t per; cl_ulong lim;
     memset(g, 0, sizeof *g);
     g->bs = bs; g->cap = bs;
+    cl.GetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof maxalloc, &maxalloc, NULL);
+    cl.GetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof gmem, &gmem, NULL);
+    /* many blocks in flight = many GPU threads busy; bounded by device memory */
+    per = (size_t)bs * 2 + GPZ_PSTRIDE * 2 + GPZ_HSIZE * 4 + 16;
+    lim = gmem / 3 / per;
+    if (maxalloc && maxalloc / GPZ_HSIZE / 4 < lim) lim = maxalloc / GPZ_HSIZE / 4;
+    if (maxalloc && maxalloc / bs < lim) lim = maxalloc / bs;
+    g->maxb = lim > 8192 ? 8192 : lim < 16 ? 16 : (u32)lim;
     g->ctx = cl.CreateContext(NULL, 1, &dev, NULL, NULL, &e); clcheck(e, "context");
     g->q = cl.CreateCommandQueue(g->ctx, dev, 0, &e); clcheck(e, "queue");
     srcs[0] = GPZ_CL_SRC; len = strlen(GPZ_CL_SRC);
@@ -158,14 +168,14 @@ static void gpu_open(Gpu *g, cl_device dev, u32 bs) {
     }
     g->kc = cl.CreateKernel(g->prog, "gpz_compress_k", &e); clcheck(e, "kernel c");
     g->kd = cl.CreateKernel(g->prog, "gpz_decompress_k", &e); clcheck(e, "kernel d");
-    g->src  = mkbuf(g, CL_MEM_READ_WRITE, (size_t)BATCH * bs, "buf src");
-    g->out  = mkbuf(g, CL_MEM_READ_WRITE, (size_t)BATCH * g->cap, "buf out");
-    g->osz  = mkbuf(g, CL_MEM_READ_WRITE, BATCH * 4, "buf osz");
-    g->P    = mkbuf(g, CL_MEM_READ_WRITE, (size_t)BATCH * GPZ_PSTRIDE * 2, "buf P");
-    g->H    = mkbuf(g, CL_MEM_READ_WRITE, (size_t)BATCH * GPZ_HSIZE * 4, "buf H");
-    g->ioff = mkbuf(g, CL_MEM_READ_ONLY, BATCH * 4, "buf ioff");
-    g->tab  = mkbuf(g, CL_MEM_READ_ONLY, BATCH * 4, "buf tab");
-    g->st   = mkbuf(g, CL_MEM_READ_WRITE, BATCH * 4, "buf st");
+    g->src  = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->maxb * bs, "buf src");
+    g->out  = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->maxb * g->cap, "buf out");
+    g->osz  = mkbuf(g, CL_MEM_READ_WRITE, g->maxb * 4, "buf osz");
+    g->P    = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->maxb * GPZ_PSTRIDE * 2, "buf P");
+    g->H    = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->maxb * GPZ_HSIZE * 4, "buf H");
+    g->ioff = mkbuf(g, CL_MEM_READ_ONLY, g->maxb * 4, "buf ioff");
+    g->tab  = mkbuf(g, CL_MEM_READ_ONLY, g->maxb * 4, "buf tab");
+    g->st   = mkbuf(g, CL_MEM_READ_WRITE, g->maxb * 4, "buf st");
 }
 
 #define ARG(k, i, v) clcheck(cl.SetKernelArg(k, i, sizeof(v), &(v)), "arg")
@@ -178,8 +188,12 @@ static void gpu_compress(Gpu *g, const u8 *src, u32 batch_len, u32 nblk, u8 *out
     ARGM(g->kc, 0, g->src); ARG(g->kc, 1, bl); ARG(g->kc, 2, bs); ARGM(g->kc, 3, g->out);
     ARG(g->kc, 4, cap); ARGM(g->kc, 5, g->osz); ARGM(g->kc, 6, g->P); ARGM(g->kc, 7, g->H);
     ARG(g->kc, 8, nb); ARG(g->kc, 9, lazy);
-    clcheck(cl.EnqueueNDRangeKernel(g->q, g->kc, 1, NULL, &gws, NULL, 0, NULL, NULL), "run compress");
-    clcheck(cl.Finish(g->q), "finish");
+    {
+        double t0 = now();
+        clcheck(cl.EnqueueNDRangeKernel(g->q, g->kc, 1, NULL, &gws, NULL, 0, NULL, NULL), "run compress");
+        clcheck(cl.Finish(g->q), "finish");
+        g->ktime += now() - t0; g->launches++;
+    }
     clcheck(cl.EnqueueReadBuffer(g->q, g->osz, 1, 0, (size_t)nblk * 4, osz, 0, NULL, NULL), "read sizes");
     clcheck(cl.EnqueueReadBuffer(g->q, g->out, 1, 0, (size_t)nblk * cap, out, 0, NULL, NULL), "read out");
 }
@@ -187,20 +201,25 @@ static void gpu_compress(Gpu *g, const u8 *src, u32 batch_len, u32 nblk, u8 *out
 /* Decompress nblk blocks. `in` = their concatenated payload (in_len bytes). */
 static int gpu_decompress(Gpu *g, const u8 *in, u32 in_len, const u32 *tab, u32 nblk,
                           u32 raw_len, u8 *out) {
-    u32 ioff[BATCH], st[BATCH], i, o = 0, bs = g->bs, nb = nblk, rl = raw_len; size_t gws = nblk;
+    u32 *ioff = (u32 *)malloc((size_t)nblk * 8 + 8), *st = ioff + nblk, i, o = 0, bs = g->bs, nb = nblk, rl = raw_len;
+    size_t gws = nblk; double t0;
+    if (!ioff) die("out of memory");
     for (i = 0; i < nblk; i++) { ioff[i] = o; o += tab[i] & 0x7FFFFFFFu; }
-    if (o != in_len) return 1;
+    if (o != in_len) { free(ioff); return 1; }
     clcheck(cl.EnqueueWriteBuffer(g->q, g->src, 1, 0, in_len ? in_len : 1, in, 0, NULL, NULL), "write in");
     clcheck(cl.EnqueueWriteBuffer(g->q, g->ioff, 1, 0, (size_t)nblk * 4, ioff, 0, NULL, NULL), "write ioff");
     clcheck(cl.EnqueueWriteBuffer(g->q, g->tab, 1, 0, (size_t)nblk * 4, tab, 0, NULL, NULL), "write tab");
     ARGM(g->kd, 0, g->src); ARGM(g->kd, 1, g->ioff); ARGM(g->kd, 2, g->tab); ARG(g->kd, 3, rl);
     ARG(g->kd, 4, bs); ARGM(g->kd, 5, g->out); ARGM(g->kd, 6, g->st); ARGM(g->kd, 7, g->P);
     ARG(g->kd, 8, nb);
+    t0 = now();
     clcheck(cl.EnqueueNDRangeKernel(g->q, g->kd, 1, NULL, &gws, NULL, 0, NULL, NULL), "run decompress");
     clcheck(cl.Finish(g->q), "finish");
+    g->ktime += now() - t0; g->launches++;
     clcheck(cl.EnqueueReadBuffer(g->q, g->st, 1, 0, (size_t)nblk * 4, st, 0, NULL, NULL), "read st");
     clcheck(cl.EnqueueReadBuffer(g->q, g->out, 1, 0, raw_len, out, 0, NULL, NULL), "read raw");
-    for (i = 0; i < nblk; i++) if (st[i]) return 1;
+    for (i = 0; i < nblk; i++) if (st[i]) { free(ioff); return 1; }
+    free(ioff);
     return 0;
 }
 
@@ -242,9 +261,16 @@ static Gpu *pick_gpu(Gpu *store, const Opt *o, u32 bs) {
     return store;
 }
 
+static void gpu_report(const Gpu *g, u32 nb) {
+    if (verbose)
+        fprintf(stderr, "gpz: GPU: %lu blocks of %lu bytes, up to %lu GPU threads per launch, %lu launches, %.2fs in kernels\n",
+                (unsigned long)nb, (unsigned long)g->bs, (unsigned long)g->maxb, (unsigned long)g->launches, g->ktime);
+}
+
 static void do_compress(const char *in, const char *outp, const Opt *o) {
+    int bslog = o->bslog ? o->bslog : 16;
     size_t n; u8 *src = slurp(in, &n), *cbuf, *tabb, hdr[HDR];
-    u32 bs = 1u << o->bslog, cap = bs, nb, i, *osz, total = 0; Gpu gs, *g; double t0 = now();
+    u32 bs = 1u << bslog, cap = bs, nb, i, *osz, total = 0; Gpu gs, *g; double t0 = now();
     if (n > 0xFFFFFFFFu) die("file too large for this build");
     nb = (u32)((n + bs - 1) / bs);
     cbuf = (u8 *)malloc((size_t)nb * cap + 1); osz = (u32 *)malloc((size_t)nb * 4 + 4);
@@ -252,8 +278,8 @@ static void do_compress(const char *in, const char *outp, const Opt *o) {
     if (!cbuf || !osz || !tabb) die("out of memory");
     g = pick_gpu(&gs, o, bs);
     if (g) {
-        for (i = 0; i < nb; i += BATCH) {
-            u32 cnt = nb - i < BATCH ? nb - i : BATCH;
+        for (i = 0; i < nb; i += g->maxb) {
+            u32 cnt = nb - i < g->maxb ? nb - i : g->maxb;
             size_t off = (size_t)i * bs, len = n - off;
             if (len > (size_t)cnt * bs) len = (size_t)cnt * bs;
             gpu_compress(g, src + off, (u32)len, cnt, cbuf + (size_t)i * cap, osz + i, (u32)o->lazy);
@@ -272,7 +298,7 @@ static void do_compress(const char *in, const char *outp, const Opt *o) {
         if (osz[i] == GPZ_FAIL || osz[i] >= len) { put32(tabb + 4 * i, len | 0x80000000u); osz[i] = GPZ_FAIL; total += len; }
         else { put32(tabb + 4 * i, osz[i]); total += osz[i]; }
     }
-    memcpy(hdr, MAGIC, 4); hdr[4] = 0; hdr[5] = (u8)o->bslog; hdr[6] = hdr[7] = 0;
+    memcpy(hdr, MAGIC, 4); hdr[4] = 0; hdr[5] = (u8)bslog; hdr[6] = hdr[7] = 0;
     put32(hdr + 8, (u32)n); put32(hdr + 12, 0); put32(hdr + 16, crc32(src, n));
     {
         FILE *f = fopen(outp, "wb");
@@ -285,6 +311,7 @@ static void do_compress(const char *in, const char *outp, const Opt *o) {
         }
         if (fclose(f)) die("write error");
     }
+    if (g) gpu_report(g, nb);
     fprintf(stderr, "gpz: %s -> %s: %lu -> %lu bytes (%.1f%%) on %s in %.2fs\n", in, outp,
                 (unsigned long)n, (unsigned long)(HDR + (size_t)nb * 4 + total),
                 n ? 100.0 * (HDR + (size_t)nb * 4 + total) / n : 100.0, g ? "GPU" : "CPU", now() - t0);
@@ -307,8 +334,8 @@ static void do_decompress(const char *in, const char *outp, const Opt *o) {
     p = f + HDR + (size_t)nb * 4;
     { Opt oo = *o; g = pick_gpu(&gs, &oo, bs); }
     if (g) {
-        for (i = 0; i < nb; i += BATCH) {
-            u32 cnt = nb - i < BATCH ? nb - i : BATCH, j, plen = 0;
+        for (i = 0; i < nb; i += g->maxb) {
+            u32 cnt = nb - i < g->maxb ? nb - i : g->maxb, j, plen = 0;
             size_t off = (size_t)i * bs, len = size - off;
             if (len > (size_t)cnt * bs) len = (size_t)cnt * bs;
             for (j = 0; j < cnt; j++) plen += tab[i + j] & 0x7FFFFFFFu;
@@ -332,6 +359,7 @@ static void do_decompress(const char *in, const char *outp, const Opt *o) {
     if (bad) die("corrupt data");
     if (crc32(raw, size) != get32(f + 16)) die("checksum mismatch");
     spit(outp, raw, size, NULL, 0, NULL, 0);
+    if (g) gpu_report(g, nb);
     fprintf(stderr, "gpz: %s -> %s: %lu bytes on %s in %.2fs\n", in, outp,
             (unsigned long)size, g ? "GPU" : "CPU", now() - t0);
     free(f); free(raw); free(tab);
@@ -357,13 +385,13 @@ static void usage(void) {
           "         -m MAX RATIO: context mixing + deflate recompression (CPU, slow)\n"
           "         -n with -m: do not recompress zip/gzip streams\n"
           "         -u fast mode: lazy matching, smaller output, slower\n"
-          "         -b N block size = 2^N bytes (10..24, default 16)   -v verbose\n", stderr);
+          "         -b N block size = 2^N bytes (10..24, default 16; 14 = more GPU threads, worse ratio)   -v verbose\n", stderr);
     exit(2);
 }
 
 int main(int argc, char **argv) {
     Opt o; int a = 1; const char *cmd, *in, *out; char *buf = NULL;
-    memset(&o, 0, sizeof o); o.bslog = 16;
+    memset(&o, 0, sizeof o);
     for (; a < argc && argv[a][0] == '-' && argv[a][1]; a++) {
         switch (argv[a][1]) {
         case 'g': o.force_gpu = 1; break;
