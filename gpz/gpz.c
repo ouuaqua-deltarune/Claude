@@ -526,6 +526,7 @@ static void usage(void) {
           "  gpz unpack [opts] <archive.gpza> [dest]     restore exactly (use --force into a non-empty dir)\n"
           "  gpz verify <archive.gpza>                   check every file's checksum, writes nothing\n"
           "  gpz ls     <archive.gpza>                   list contents and snapshot time\n"
+          "  pack verifies the new archive by default (--no-verify to skip)\n"
           "  opts: -t N CPU threads  -g|-c force/forbid GPU  -d N GPU index  --vram MB  --slots N  --model BITS\n"
           "        -x PATTERN exclude (repeatable, e.g. -x cache -x '*.tmp')  -n no deflate recompression\n"
           "Single files:\n"
@@ -549,6 +550,7 @@ int main(int argc, char **argv) {
         if (argv[a][1] == '-') {                       /* long options (archive mode) */
             const char *k = argv[a] + 2;
             if (!strcmp(k, "force")) ao.force = 1;
+            else if (!strcmp(k, "no-verify")) ao.noverify = 1;
             else if (!strcmp(k, "vram") && a + 1 < argc) ao.vram_mb = strtoul(argv[++a], NULL, 10);
             else if (!strcmp(k, "slots") && a + 1 < argc) ao.slots = (u32)atoi(argv[++a]);
             else if (!strcmp(k, "model") && a + 1 < argc) ao.tbits = (u32)atoi(argv[++a]);
@@ -587,7 +589,12 @@ int main(int argc, char **argv) {
             snprintf(def, sizeof def, "%s-%04d%02d%02d-%02d%02d%02d.gpza", b[0] ? b : "snapshot", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
             free(rp);
         }
-        do_pack(root, def, &ao); return 0;
+        do_pack(root, def, &ao);
+        if (!ao.noverify) {                              /* never leave an unchecked archive behind */
+            fprintf(stderr, "gpz: verifying the new archive (decodes every file and checks its checksum)...\n");
+            do_unpack(def, NULL, &ao, 1);
+        }
+        return 0;
     }
     if ((!strcmp(cmd, "unpack") || !strcmp(cmd, "verify") || !strcmp(cmd, "ls")) && a < argc) {
         if (!strcmp(cmd, "ls")) { do_ls(argv[a], 0); return 0; }

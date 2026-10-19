@@ -14,7 +14,7 @@
 #define AR_FOOT 80
 
 typedef struct {
-    int threads, use_gpu, force_gpu, force_cpu, dev, notx, force, nexcl;
+    int threads, use_gpu, force_gpu, force_cpu, dev, notx, force, nexcl, noverify;
     unsigned long vram_mb; u32 slots, tbits, umax;
     const char *excl[32];
 } ArOpt;
