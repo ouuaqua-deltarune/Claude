@@ -205,8 +205,8 @@ FN u32 gpz_dec_block(GP const u8 *in, u32 ilen, GP u8 *o, u32 n, GP u16 *P) {
 __kernel void gpz_compress_k(__global const uchar *src, uint batch_len, uint bs,
                              __global uchar *out, uint cap, __global uint *osz,
                              __global ushort *Pall, __global uint *Hall,
-                             uint nblk, uint lazy) {
-    uint g = (uint)get_global_id(0), off, n;
+                             uint nblk, uint lazy, uint first) {
+    uint g = first + (uint)get_global_id(0), off, n;
     if (g >= nblk) return;
     off = g * bs; n = batch_len - off; if (n > bs) n = bs;
     osz[g] = gpz_enc_block(src + off, n, out + (size_t)g * cap, cap,
@@ -217,8 +217,8 @@ __kernel void gpz_compress_k(__global const uchar *src, uint batch_len, uint bs,
 __kernel void gpz_decompress_k(__global const uchar *in, __global const uint *ioff,
                                __global const uint *tab, uint raw_len, uint bs,
                                __global uchar *out, __global uint *status,
-                               __global ushort *Pall, uint nblk) {
-    uint g = (uint)get_global_id(0), off, n, e, len, k;
+                               __global ushort *Pall, uint nblk, uint first) {
+    uint g = first + (uint)get_global_id(0), off, n, e, len, k;
     if (g >= nblk) return;
     off = g * bs; n = raw_len - off; if (n > bs) n = bs;
     e = tab[g]; len = e & 0x7FFFFFFFu;

@@ -60,15 +60,26 @@ byte-identical and checked by CRC. Streams that cannot be reproduced stay as-is.
 Cost: about 0.25 MB/s, CPU only (context mixing is sequential, so it does not
 map onto the GPU), roughly 150 MB of RAM. It is for archiving, not speed.
 
-## GPU parallelism
-Fast mode launches one GPU thread per block and keeps up to 8192 blocks in
-flight per launch (bounded by device memory, auto-detected), so large files
-keep thousands of GPU threads busy. `-v` prints the thread count, launches and
-time spent in kernels. For more threads on smaller files use `-b 14` (16 KB
-blocks): more parallelism, but text compresses roughly 20% worse.
+## GPU parallelism and memory
+Fast mode runs one GPU thread per block and sizes its batches from the device's
+real memory, so it works on any OpenCL GPU, and is aimed at GPUs with 4 GB or
+more of VRAM / unified memory:
+- **Dedicated GPU:** uses up to 70% of VRAM for working buffers.
+- **Unified memory (Apple Silicon, integrated):** uses a quarter of the shared RAM
+  (at most 4 GiB), since the OS needs the rest.
+- **Allocation failures:** it halves the batch until the driver accepts it.
+- **Watchdog-safe:** work is split into short launches whose size adapts to how
+  long each takes, so slow GPUs do not trip the driver's timeout.
+- **Fallback:** if the GPU fails at any point, the remaining work finishes on the
+  CPU with identical output (use `-g` to make that an error instead).
+- Smaller GPUs (< 4 GB) work too, just with smaller batches.
 
-CUDA: NVIDIA GPUs are already driven through their OpenCL driver (same cores).
-A native CUDA backend is not included; I could not build or test one.
+`-v` prints the device memory, the budget used, launches and kernel time;
+`gpz list` shows each device, its memory type and max buffer. For more threads on
+small files use `-b 14` (16 KB blocks): more parallelism, text compresses ~20% worse.
+
+CUDA: NVIDIA GPUs are driven through their OpenCL driver (same cores). A native
+CUDA backend is not included; I could not build or test one.
 Max-ratio mode is CPU-only: each model needs ~150 MB, which cannot be
 replicated across thousands of GPU threads.
 

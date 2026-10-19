@@ -35,6 +35,16 @@ for f in empty one random zeros text mixed; do
   done
   echo "ok $f ($(wc -c < $T/$f) -> $(wc -c < $T/$f.cpu) bytes)"
 done
+# GPU robustness: tiny/4 GB VRAM budgets and a failing GPU must still produce correct output
+if [ $GPU = 1 ]; then
+  for mb in 4096 64 8; do
+    GPZ_VRAM_MB=$mb ./gpz -g c $T/text $T/v.gpz 2>/dev/null; GPZ_VRAM_MB=$mb ./gpz -g d $T/v.gpz $T/v.out 2>/dev/null
+    cmp -s $T/text $T/v.out || { echo "FAIL vram budget $mb MB"; fail=1; }
+  done
+  GPZ_TEST_GPUFAIL=1 ./gpz c $T/text $T/f.gpz 2>/dev/null; GPZ_TEST_GPUFAIL=1 ./gpz d $T/f.gpz $T/f.out 2>/dev/null
+  cmp -s $T/text $T/f.out || { echo "FAIL gpu-failure fallback"; fail=1; }
+  echo "ok vram budgets (4096/64/8 MB) and GPU-failure fallback"
+fi
 # max-ratio mode (context mixing), with and without deflate recompression
 for f in empty one random zeros text mixed; do
   ./gpz -m c $T/$f $T/$f.cm 2>/dev/null; ./gpz d $T/$f.cm $T/$f.cmrt 2>/dev/null
